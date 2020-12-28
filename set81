@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+
+# set81 - Game of finding sets of 3 cards with 4 features of 3 modalities.
+#   Each feature in a set must either be all the same, or all different.
+# Usage:  set81 [-d|debug] [ -c|--collect | -s|--stats | -p|--play ]
+#           -d/--debug:    Add extra output
+#           -c/--collect:  Just generate files "sets[s]" with general info
+#           -s/--stats:    Keep playing automated games and collect stats
+#           -p/--play:     Default: interactively display open cards and sets
+# Required: imagemagick(convert montage) coreutils(shuf rm tee) psmisc(killall)
+#           feh[play] grep sed[help]
+
+# Can be preset for the first game here or on the commandline
+#seed= stock=()
+
+dir=${0%/*} play=1 debug=0 collect=0 stats=$dir/stats games=$dir/games
+while (($#))
+do
+	case $1 in
+	-h|--help) sed -n "/# Required/q;s@set81@${0##*/}@g;s@^# @@p" "$0" &&
+		exit 0 ;;
+	-d|--debug) debug=1 ;; # Extra stderr output
+	-c|--collect) collect=1 ;; # Generate sets overview
+	-s|--stats) play=0 ;; # Only collect statistics
+	*) echo "Unknown argument" && exit 1
+	esac
+	shift
+done # processing commandline arguments
+
+# Output message to stderr
+Debug(){ # $@:message  I:debug  O>stderr
+	((debug)) && echo -en "$@" >&2
+}
+
+# Generate card graphics
+Cards(){ # O>"????.png"
+	declare -g description
+	# Arguments to imagemagick
+	local cardsize=200 color='#000' bg='#555'
+	local octagon="path 'M 40,70 L 40,130 L 70,160 L 130,160 L 160,130 L 160,70 \
+		L 130,40 L 70,40 L 40,70 Z'"
+	local hexagon="path 'M 30,100 L 70,160 L 130,160 L 170,100 L 130,40 L 70,40 \
+		L 30,100 Z'"
+	local pentagon="path 'M 30,90 L 70,160 L 130,160 L 170,90 L 100,30 L 30,90 \			Z'"
+	local bigsquare="path 'M 35,35 L 35,165 L 165,165 L 165,35 L 35,35 Z'"
+	local bigtriangle="path 'M 10,150 L 190,150 L 100,10 L 10,150 Z'"
+	local bigcircle="circle 100,100 100,30"
+	local square="path 'M 70,70 L 70,130 L 130,130 L 130,70 L 70,70 Z'"
+	local triangle="path 'M 60,130 L 140,130 L 100,60 L 60,130 Z'"
+	local circle="circle 100,100 100,60"
+	local p0=('yellow' 'cyan' 'pink')
+	local p1=("octagon" "hexagon" "pentagon")
+	local p1=("bigsquare" "bigtriangle" "bigcircle")
+	local p2=('green' 'blue' 'red')
+	local p3=("square" "triangle" "circle")
+	description=(${p0[@]} ${p1[@]} ${p2[@]} ${p3[@]})
+	((!play || $(echo [0-2][0-2][0-2][0-2].png |wc -w)==81)) && return
+	local f0 f1 f2 f3
+	for f0 in 0 1 2
+	do for f1 in 0 1 2
+		do for f2 in 0 1 2
+			do for f3 in 0 1 2
+				do convert -size ${cardsize}x$cardsize xc:$bg -fill ${p0[f0]} \
+						-stroke $color -draw "${!p1[f1]}" -fill ${p2[f2]} \
+						-stroke $color -draw "${!p3[f3]}" $f0$f1$f2$f3.png &
+				done
+			done
+		done
+	done
+}
+
+# Show all open cards
+Render(){ # $1:round  I:set,hint,open,card,nsets,nopen
+	((!play || !nopen)) && return
+	local list i j s img bg='#555'
+	for i in ${open[@]}
+	do list+=" ${card[i]}.png"
+	done # processing open cards
+	((nsets==1)) || s=s
+	((nsets)) || s+=' [game end]'
+	montage -background $bg $list "$round: $nsets set$s"
+	for j in "${!set[@]}"
+	do
+		list=
+		for i in ${set[j]}
+		do list+=" ${card[i]}.png"
+		done # processing set
+		s=${hint[j]} s=${s#*\"} s=${s%\"*}
+		printf -v img '%x. %s' $((j+1)) "$s"
+		montage -background $bg $list "$img"
+	done # processing sets
+	feh -N -x -e 'i/16' --info "echo %N" --action9='touch quit; killall feh' \
+		-A "killall feh" --action3="[next_img]" --action1="[prev_img]" \
+		$round:* [1-9a-f].* 2>/dev/null
+	[[ -f quit ]] && rm -f -- quit $round:* [1-9a-f].* && exit 2
+	rm -f -- $round:* [1-9a-f].*
+}
+
+# Check for a set
+Set(){ # $1-3:i  I:description  O:hint  O>"result desc"  R:0/1(set/not)
+	# 81 cards (3^4: 4 features of 3 modalities):
+	# 85320 triplets, 1080 sets, 81! = 5.8e120 stock permutations
+	# set types: ****(0-set:216) ***z(1-set:432) **yz(2-set:324) *xyz(3-set:108)
+	# card: w,x,y,z=0-2,0-2,0-2,0-2 -> 0/1/4,0/1/4,0/1/4,0/1/4 (informative sum)
+	# x1+x2+x3= 0:000/1:100/2:110/3:111/4:400/5:410/6:411/8:440/9:441/c:444
+	# allthesame: x1=x2=x3 sum=0/3/c; alldifferent: x1!=x2!=x3 sum=5
+	# 0-Set ****: 0000 1111 4444 / 0411 4104 1042  +: 5,5,5,5
+	# 1-Set ***z: 0000 1110 2220  +: 5,5,5,0/3/c
+	# 2-Set **yz: 0001 1101 4401  +: 5,5,0/3/c,0/3/c
+	# 3-Set *xyz: 0014 1014 4014  +: 5,0/3/c,0/3/c,0/3/c
+	declare -g hint
+	local h1=0x${card[$1]//2/4} h2=0x${card[$2]//2/4} h3=0x${card[$3]//2/4}
+	local d result s pos desc sum=$(printf '%04x' $(($h1+$h2+$h3)))
+	local -i alldif feature with set=1
+	for feature in 0 1 2 3
+	do
+		case ${sum:feature:1} in
+		5) pos='*' alldif+=1 ;;
+		0) pos=0 ;;
+		3) pos=1 ;;
+		c) pos=2 ;;
+		*) pos='_' set=0
+		esac
+		result+=$pos
+		if [[ $pos = [0-2] ]]
+		then
+			((feature<2)) && with=1
+			((with && feature>1)) && with=0 desc+='with '
+			desc+="${description[3*feature+pos]} "
+		fi
+	done # processing features
+	desc=${desc% }
+	#Debug "$sum $desc "
+	((collect)) && echo -n "$result "
+	if ((set))
+	then
+		[[ $desc ]] &&
+			desc="A \"$desc\" set" ||
+			desc='An "everything different" set'
+		((collect)) && echo " $((4-alldif))-Set: $desc"
+		Debug "$result: $desc\n"
+		hint+=("$desc")
+		return 0
+	else ((collect)) && echo
+	fi
+	return 1
+}
+
+Sets(){ # $1:n  I:open  O:hint,set,nsets  R:0/1(sets/none)
+	local a b c n=$1 s
+	declare -g set=() hint=() nsets=0
+	# n: number of cards to compare (3<=n<=81)
+	((n<3)) && return 0
+	for a in $(eval "echo {0..$((n-3))}")
+	do for b in $(eval "echo {$((a+1))..$((n-2))}")
+		do for c in $(eval "echo {$((b+1))..$((n-1))}")
+			do
+				s=" ${open[a]} ${open[b]} ${open[c]} "
+				Set $s && set[nsets++]=$s
+			done
+		done
+	done
+	# nsets: number of sets found
+	return $((!nsets))
+}
+
+# Main
+
+card=({0..2}{0..2}{0..2}{0..2})
+# Generate card images and descriptions
+Cards
+
+# Generate all sets out of a collection
+if ((collect))
+then
+	stock=({0..81}) sets=$dir/sets
+	>"$sets"
+	n=81
+	# zero-based array, lower n by 1
+	for a in $(eval "echo {0..$((n-3))}")
+	do for b in $(eval "echo {$((a+1))..$((n-2))}")
+		do for c in $(eval "echo {$((b+1))..$((n-1))}")
+			do echo "${card[a]},${card[b]},${card[c]} $(Set $a $b $c)" >>"$sets"
+			done
+		done
+	done
+	grep -o 'A.*$' "$sets" |sort |uniq -c |sort -n >"$sets"s
+	exit 0
+fi
+
+# Play
+
+game=0
+while ((++game))
+do # New game
+	# If stock or seed are preset, keep those for the first game
+	[[ $stock ]] || stock=($(shuf -i 0-80))
+	[[ $seed ]] || seed=$RANDOM
+	open=() st= RANDOM=$seed saved=${stock[@]} nopen=0 topstock=80 round=0 add=9
+	while ((++round))
+	do # New round: check the sets status
+		Sets $nopen
+		while ((topstock>0))
+		do # Stock has at least 3 more cards
+			# Done if at least 9 open cards with a set
+			((nsets && nopen>6)) && break
+			# Add 3 cards (9 cards at the start)
+			while ((add--))
+			do # Add at a random place
+				((pos=RANDOM%(++nopen)))
+				open[nopen-1]=${open[pos]}
+				open[pos]=${stock[topstock--]}
+			done # adding triplet or initial nine
+			add=3
+			Sets $nopen
+		done # adding cards until set present or cards gone
+		((play)) || st+=$(printf '%2d:%x ' $nopen $nsets)
+		Debug "$nsets: $(printf '%s-' "${set[@]}"; printf ' %s;' "${hint[@]}")\n"
+		Render $round
+		((nsets)) || break
+		# Remove random set from open
+		i=0 j=0 tmp=() s=$((RANDOM%nsets))
+		while ((i<nopen))
+		do [[ ! ${set[s]} = *' '${open[i++]}' '* ]] &&
+				tmp[j++]=${open[i-1]}
+		done # removing set
+		nopen=$j open=(${tmp[@]})
+	done # round
+
+	((nopen)) || echo "seed=$seed stock=($saved) #:0" >>"$games"
+	n=$(grep -o ':[abc]' <<<$st) &&
+		echo "seed=$seed stock=($saved) #"$n >>"$games"
+	((play)) || echo "$st" >>"$stats"
+	if ((!play && game%100==1))
+	then
+		n=$(grep -c ':0 $' "$stats")
+		echo -e "\nSet81 statistics after $game games, $n total:"
+		pat=('0:0' '6:0' '9:0' '12:0' '15:0' '18:0' '21:' '18:' '15:' '12:'
+			':c' ':b' ':a' ':9' ':8' ':7' ':6' ':5' ':4' ':3' ':2'
+			'18:c' '18:b' '18:a' '18:9' '18:8' '18:7' '18:6'
+			'15:c' '15:b' '15:a' '15:9' '15:8' '15:7'
+			'12:8' '12:7' '12:6' '12:5' '12:4' '9:6' '9:5' '9:4' '9:3'
+		)
+		des=('0 left' '6 left' '9 left' '12 left' '15 left' '18 left'
+			'21 cards open' '18 cards open' '15 cards open' '12 cards open'
+			'12 sets' '11 sets' '10 sets' '9 sets' '8 sets' '7 sets' '6 sets'
+			'5 sets' '4 sets' '3 sets' '2 sets'
+			'12 sets with 18 open' '11 sets with 18 open' '10 sets with 18 open'
+			'9 sets with 18 open' '8 sets with 18 open' '7 sets with 18 open'
+			'6 sets with 18 open'
+			'12 sets with 15 open' '11 sets with 15 open' '10 sets with 15 open'
+			'9 sets with 15 open' '8 sets with 15 open' '7 sets with 15 open'
+			'8 sets with 12 open' '7 sets with 12 open'
+			'6 sets with 12 open' '5 sets with 12 open' '4 sets with 12 open'
+			'6 sets with 9 open' '5 sets with 9 open'
+			'4 sets with 9 open' '3 sets with 9 open'
+		)
+		((${#pat[@]}!=${#des[@]})) &&
+			echo "Mismatch of patterns & descriptions" && exit 3
+		for i in ${!pat[@]}
+		do s=$(grep -c "${pat[i]}" stats) p=$(echo $s/$n |bc -l)
+			printf '%8d %.7f %-21s' $s $p "${des[$i]}"
+		done # processing patterns/descriptions
+	fi
+	seed= stock=
+done # playing games
+
+exit 0
